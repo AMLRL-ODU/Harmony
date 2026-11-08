@@ -1,0 +1,950 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report,
+    confusion_matrix
+)
+from scipy import stats as sp_stats
+from collections import Counter
+import warnings
+
+warnings.filterwarnings('ignore')
+SEED           = 42
+N_FEATURES     = 512          
+K_PAT          = 15
+K_FEAT         = 15
+
+THR_METHOD     = 'otsu'
+THR_PCTILE     = 85
+THR_NSTD       = 1.0
+
+EMBED_DIM      = 128
+N_LAYERS       = 3
+NUM_CLASSES    = 5
+EPOCHS         = 100
+LR             = 1e-3
+WARMUP_EPOCHS  = 10
+N_SAMPLE       = 15
+MAX_NBR        = 15
+FOCAL_GAMMA    = 1.0
+N_HEADS        = 4
+DROPOUT        = 0.3
+-
+SMOTE_RATIO       = 0.5
+USE_CLASS_WEIGHTS = False
+SELECT_METRIC     = 'weighted'  
+EVAL_EVERY        = 1
+
+TRAIN_FILES = ['1_tr.csv', '2_tr.csv', '3_tr.csv']
+TEST_FILES  = ['1_te.csv', '2_te.csv', '3_te.csv']
+VAL_SIZE    = 0.2   # fraction of the *training* files held out as validation
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+print(f"Device     : {DEVICE}")
+print(f"Threshold  : data-driven ({THR_METHOD})")
+print(
+    f"Imbalance  : SMOTE_RATIO={SMOTE_RATIO} "
+)
+
+def load_omics_csv(path):
+    df = pd.read_csv(path, header=None)
+    X = df.iloc[:, :-1].values.astype(np.float32)
+    y = df.iloc[:, -1].values.astype(np.int64)
+    return X, y
+
+omics_names = ['methylation', 'mrna', 'mirna']
+omics_train_full = []
+y_train_full = None
+for f in TRAIN_FILES:
+    X, y = load_omics_csv(f)
+    omics_train_full.append(X)
+    if y_train_full is None:
+        y_train_full = y
+    else:
+        assert np.array_equal(y_train_full, y), f"label mismatch in {f}"
+omics_test_full = []
+y_test = None
+for f in TEST_FILES:
+    X, y = load_omics_csv(f)
+    omics_test_full.append(X)
+    if y_test is None:
+        y_test = y
+    else:
+        assert np.array_equal(y_test, y), f"label mismatch in {f}"
+
+for nm, Xtr, Xte in zip(omics_names, omics_train_full, omics_test_full):
+    print(f"  {nm:<12}: train {Xtr.shape} | test {Xte.shape}")
+print(f"  Labels      : {np.unique(y_train_full)}  "
+      f"train_dist={dict(sorted(Counter(y_train_full).items()))}")
+print(f"  Test  dist  : {dict(sorted(Counter(y_test).items()))}")
+
+min_feats = min(X.shape[1] for X in omics_train_full)
+if N_FEATURES > min_feats:
+    print(f"  [info] reducing N_FEATURES {N_FEATURES} -> {min_feats} "
+          f"(smallest modality)")
+    N_FEATURES = min_feats
+
+print("\n[Step 2] Split + standardise...")
+
+idx = np.arange(len(y_train_full))
+tr_idx, val_idx = train_test_split(
+    idx,
+    test_size=VAL_SIZE,
+    stratify=y_train_full,
+    random_state=SEED
+)
+
+omics_train_raw, omics_val_raw, omics_test_raw = [], [], []
+
+for X_tr_full, X_te in zip(omics_train_full, omics_test_full):
+    sc = StandardScaler()
+
+    omics_train_raw.append(sc.fit_transform(X_tr_full[tr_idx]))   # fit on train only
+    omics_val_raw.append(sc.transform(X_tr_full[val_idx]))
+    omics_test_raw.append(sc.transform(X_te))
+
+y_train_raw = y_train_full[tr_idx]
+y_val       = y_train_full[val_idx]
+def mi_filter(X_tr, y_tr, X_val, X_te, n_top, seed=42):
+    scores = mutual_info_classif(X_tr, y_tr, random_state=seed)
+    top_idx = np.argsort(scores)[::-1][:n_top]
+    return X_tr[:, top_idx], X_val[:, top_idx], X_te[:, top_idx]
+
+omics_train_mi, omics_val_mi, omics_test_mi = [], [], []
+
+for Xtr, Xval, Xte in zip(omics_train_raw, omics_val_raw, omics_test_raw):
+    Xtr_f, Xval_f, Xte_f = mi_filter(
+        Xtr,
+        y_train_raw,
+        Xval,
+        Xte,
+        N_FEATURES,
+        SEED
+    )
+
+    omics_train_mi.append(Xtr_f)
+    omics_val_mi.append(Xval_f)
+    omics_test_mi.append(Xte_f)
+
+def smote_numpy(X, y, k_neighbors=3, seed=42, ratio=1.0):
+
+    rng      = np.random.default_rng(seed)
+    classes  = np.unique(y)
+    counts   = {c: (y == c).sum() for c in classes}
+    majority = max(counts.values())
+
+    X_parts, y_parts = [X], [y]
+
+    for cls in classes:
+        n_needed = int(round((majority - counts[cls]) * ratio))
+
+        if n_needed <= 0:
+            continue
+
+        X_cls = X[y == cls]
+        n_cls = len(X_cls)
+        k_act = min(k_neighbors, n_cls - 1)
+
+        if k_act < 1:
+            noise = rng.normal(0, 0.01, (n_needed, X_cls.shape[1]))
+            X_parts.append(
+                (np.tile(X_cls[0], (n_needed, 1)) + noise).astype(np.float32)
+            )
+            y_parts.append(np.full(n_needed, cls, dtype=y.dtype))
+            continue
+
+        dists = np.sum(
+            (X_cls[:, None] - X_cls[None]) ** 2,
+            axis=-1
+        )
+
+        np.fill_diagonal(dists, np.inf)
+        knn = np.argsort(dists, axis=1)[:, :k_act]
+
+        X_syn = np.zeros((n_needed, X_cls.shape[1]), dtype=np.float32)
+
+        for i in range(n_needed):
+            base = rng.integers(0, n_cls)
+            nn_idx = knn[base, rng.integers(0, k_act)]
+            lam = rng.random()
+            X_syn[i] = X_cls[base] + lam * (X_cls[nn_idx] - X_cls[base])
+
+        X_parts.append(X_syn)
+        y_parts.append(np.full(n_needed, cls, dtype=y.dtype))
+
+    X_res = np.concatenate(X_parts)
+    y_res = np.concatenate(y_parts)
+
+    perm = rng.permutation(len(y_res))
+
+    return X_res[perm], y_res[perm]
+
+def apply_smote(omics_list, y, seed=42, ratio=1.0):
+    X_cat = np.concatenate(omics_list, axis=1).astype(np.float32)
+    nf = omics_list[0].shape[1]
+
+    X_r, y_r = smote_numpy(
+        X_cat,
+        y,
+        k_neighbors=3,
+        seed=seed,
+        ratio=ratio
+    )
+
+    return (
+        [X_r[:, i * nf:(i + 1) * nf] for i in range(len(omics_list))],
+        y_r.astype(np.int64)
+    )
+
+omics_train, y_train = apply_smote(
+    omics_train_mi,
+    y_train_raw,
+    seed=SEED,
+    ratio=SMOTE_RATIO
+)
+
+omics_val  = omics_val_mi
+omics_test = omics_test_mi
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(
+            logits,
+            targets,
+            weight=self.alpha,
+            reduction='none'
+        )
+        pt = torch.exp(-ce)
+        return ((1.0 - pt) ** self.gamma * ce).mean()
+
+
+def cosine_sim(X):
+    Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+    return (Xn @ Xn.T).astype(np.float32)
+
+def otsu_threshold(values, nbins=256):
+    v = values[np.isfinite(values)]
+
+    if v.size == 0:
+        return 0.0
+
+    lo, hi = float(v.min()), float(v.max())
+
+    if hi <= lo:
+        return lo
+
+    hist, edges = np.histogram(v, bins=nbins, range=(lo, hi))
+    hist = hist.astype(np.float64)
+
+    p = hist / hist.sum()
+
+    omega = np.cumsum(p)
+    mu = np.cumsum(p * np.arange(nbins))
+    mu_t = mu[-1]
+
+    denom = omega * (1.0 - omega)
+    denom[denom == 0] = 1e-12
+
+    sigma_b2 = (mu_t * omega - mu) ** 2 / denom
+
+    k = int(np.nanargmax(sigma_b2))
+    centers = (edges[:-1] + edges[1:]) / 2.0
+
+    return float(centers[k])
+
+def adaptive_threshold(sim, method='otsu',
+                       percentile=THR_PCTILE,
+                       n_std=THR_NSTD):
+
+    if sim.ndim == 2 and sim.shape[0] == sim.shape[1]:
+        vals = sim[~np.eye(sim.shape[0], dtype=bool)]
+    else:
+        vals = sim.ravel()
+
+    vals = vals[np.isfinite(vals)]
+
+    if vals.size == 0:
+        return 0.0
+
+    if method == 'otsu':
+        return otsu_threshold(vals)
+
+    if method == 'percentile':
+        return float(np.percentile(vals, percentile))
+
+    if method == 'mean_std':
+        return float(vals.mean() + n_std * vals.std())
+
+    raise ValueError(f"Unknown THR_METHOD: {method}")
+
+def build_edge_index(sim, k, thr):
+    n = sim.shape[0]
+
+    sr, tg, wt = [], [], []
+
+    for i in range(n):
+        row = sim[i].copy()
+        row[i] = -np.inf
+
+        for j in np.argsort(row)[::-1][:k]:
+            w = float(sim[i, j])
+
+            if w >= thr:
+                sr.append(i)
+                tg.append(j)
+                wt.append(w)
+
+    for i in range(n):
+        sr.append(i)
+        tg.append(i)
+        wt.append(1.0)
+
+    return (
+        torch.tensor([sr, tg], dtype=torch.long),
+        torch.tensor(wt, dtype=torch.float32)
+    )
+
+def build_hetero_graph(X, k_pat, k_feat, thr_method='otsu', name=None):
+
+    nf = X.shape[1]
+    sim_pat = cosine_sim(X)
+    thr_pat = adaptive_threshold(sim_pat, thr_method)
+    pat_ei, pat_ew = build_edge_index(sim_pat, k_pat, thr_pat)
+    sim_feat = cosine_sim(X.T)
+    thr_feat = adaptive_threshold(sim_feat, thr_method)
+    feat_ei, feat_ew = build_edge_index(sim_feat, k_feat, thr_feat)
+    fp = np.abs(X.T).astype(np.float32)
+    fp /= (fp.max(axis=1, keepdims=True) + 1e-8)
+
+    thr_fp = adaptive_threshold(fp, thr_method)
+
+    sr, tg, wt = [], [], []
+
+    for fi in range(nf):
+        for p in np.argsort(fp[fi])[::-1][:k_pat]:
+            w = float(fp[fi, p])
+
+            if w >= thr_fp:
+                sr.append(fi)
+                tg.append(p)
+                wt.append(w)
+
+    if name is not None:
+        print(
+            f"  {name:<16} thr[pat/feat/fp]="
+            f"{thr_pat:.3f}/{thr_feat:.3f}/{thr_fp:.3f}  | "
+            f"pat-pat={pat_ei.shape[1]} "
+            f"feat-feat={feat_ei.shape[1]} "
+            f"feat-pat={len(sr)}"
+        )
+
+    return {
+        'pat_pat': (
+            pat_ei,
+            pat_ew
+        ),
+        'feat_feat': (
+            feat_ei,
+            feat_ew
+        ),
+        'feat_pat': (
+            torch.tensor([sr, tg], dtype=torch.long),
+            torch.tensor(wt, dtype=torch.float32)
+        )
+    }
+
+graphs_train = [
+    build_hetero_graph(X, K_PAT, K_FEAT, THR_METHOD, name=nm)
+    for X, nm in zip(omics_train, omics_names)
+]
+
+graphs_val = [
+    build_hetero_graph(X, K_PAT, K_FEAT, THR_METHOD, name=f"{nm} (val)")
+    for X, nm in zip(omics_val, omics_names)
+]
+
+graphs_test = [
+    build_hetero_graph(X, K_PAT, K_FEAT, THR_METHOD, name=f"{nm} (test)")
+    for X, nm in zip(omics_test, omics_names)
+]
+
+class EdgeScoringMLP(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, 1),
+            nn.Sigmoid()
+        )
+
+        nn.init.zeros_(self.mlp[-2].bias)
+
+    def forward(self, h, edge_index):
+        src = edge_index[0]
+        tgt = edge_index[1]
+
+        return self.mlp(
+            torch.cat([h[src], h[tgt]], dim=-1)
+        ).squeeze(-1)
+
+class SortedLSTMLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, max_nbr=15,
+                 lstm_hidden=None, dropout=0.3):
+        super().__init__()
+
+        self.max_nbr = max_nbr
+        self.lstm_hidden = lstm_hidden or in_dim
+
+        self.lstm = nn.LSTM(
+            input_size=in_dim,
+            hidden_size=self.lstm_hidden,
+            num_layers=1,
+            batch_first=True
+        )
+
+        self.W = nn.Linear(in_dim + self.lstm_hidden, out_dim)
+        self.drop = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, x, edge_index, edge_weights):
+        x = self.drop(x)
+
+        N = x.size(0)
+        D = x.size(1)
+        dev = x.device
+
+        src = edge_index[0]
+        tgt = edge_index[1]
+
+        seqs = []
+        lengths = []
+
+        for node_i in range(N):
+            mask = (tgt == node_i)
+            nbr_idx = src[mask]
+            nbr_w = edge_weights[mask]
+
+            if nbr_idx.numel() == 0:
+                seqs.append(torch.zeros(1, D, device=dev))
+                lengths.append(1)
+                continue
+
+            order = nbr_w.argsort(descending=True)
+
+            nbr_idx = nbr_idx[order][:self.max_nbr]
+            nbr_w = nbr_w[order][:self.max_nbr]
+
+            nbr_feats = x[nbr_idx] * nbr_w.unsqueeze(-1)
+
+            seqs.append(nbr_feats)
+            lengths.append(nbr_feats.size(0))
+
+        max_len = max(lengths)
+
+        padded = torch.zeros(N, max_len, D, device=dev)
+
+        for i, seq in enumerate(seqs):
+            padded[i, :seq.size(0)] = seq
+
+        lengths_t = torch.tensor(lengths, dtype=torch.long, device='cpu')
+
+        packed = nn.utils.rnn.pack_padded_sequence(
+            padded,
+            lengths_t,
+            batch_first=True,
+            enforce_sorted=False
+        )
+
+        _, (h_n, _) = self.lstm(packed)
+
+        h_agg = h_n.squeeze(0)
+
+        combined = torch.cat([x, h_agg], dim=-1)
+
+        out = self.W(combined)
+        out = self.norm(out)
+        out = F.relu(out)
+        out = F.normalize(out, p=2, dim=-1)
+
+        return out
+class HeteroInductiveEncoder(nn.Module):
+
+    def __init__(self, n_features, embed_dim, n_layers,
+                 max_nbr=15, dropout=0.3):
+        super().__init__()
+
+        self.n_layers = n_layers
+
+        self.pat_proj = nn.Linear(n_features, embed_dim)
+        self.feat_proj = nn.Linear(6, embed_dim)
+
+        self.pat_lstms = nn.ModuleList([
+            SortedLSTMLayer(embed_dim, embed_dim, max_nbr, dropout=dropout)
+            for _ in range(n_layers)
+        ])
+
+        self.feat_lstms = nn.ModuleList([
+            SortedLSTMLayer(embed_dim, embed_dim, max_nbr, dropout=dropout)
+            for _ in range(n_layers)
+        ])
+
+        self.pat_scorer = EdgeScoringMLP(embed_dim)
+        self.feat_scorer = EdgeScoringMLP(embed_dim)
+        self.cross_scorer = EdgeScoringMLP(embed_dim)
+        self.cross_lstms = nn.ModuleList([
+            SortedLSTMLayer(embed_dim, embed_dim, max_nbr, dropout=dropout)
+            for _ in range(n_layers)
+        ])
+        self.cross_scorer_pf = EdgeScoringMLP(embed_dim)
+        self.cross_lstms_pf = nn.ModuleList([
+            SortedLSTMLayer(embed_dim, embed_dim, max_nbr, dropout=dropout)
+            for _ in range(n_layers)
+        ])
+        self.gate = nn.Sequential(
+            nn.Linear(embed_dim * 2, 2),
+            nn.Softmax(dim=-1)
+        )
+
+        # feature-side gate: feature-feature vs patient->feature (NEW)
+        self.gate_feat = nn.Sequential(
+            nn.Linear(embed_dim * 2, 2),
+            nn.Softmax(dim=-1)
+        )
+
+        self.mid_drop = nn.Dropout(0.2)
+        self.norm_pat = nn.LayerNorm(embed_dim)
+        self.norm_feat = nn.LayerNorm(embed_dim)
+
+    def _feat_stats(self, X):
+        Xn = X.detach().cpu().numpy()
+
+        s = np.stack([
+            Xn.mean(0),
+            Xn.std(0),
+            np.median(Xn, 0),
+            sp_stats.skew(Xn, 0),
+            sp_stats.kurtosis(Xn, 0),
+            np.percentile(Xn, 75, 0) - np.percentile(Xn, 25, 0)
+        ], axis=1)
+
+        return torch.tensor(s, dtype=torch.float32, device=X.device)
+
+    def forward(self, X, graph):
+        dev = X.device
+
+        h_pat = F.relu(self.pat_proj(X))
+        h_feat = F.relu(self.feat_proj(self._feat_stats(X)))
+
+        pat_ei = graph['pat_pat'][0].to(dev)
+        feat_ei = graph['feat_feat'][0].to(dev)
+        cross_ei = graph['feat_pat'][0].to(dev)   # [feature_idx, patient_idx]
+
+        for li in range(self.n_layers):
+
+            n_pat = h_pat.size(0)
+            n_feat = h_feat.size(0)
+
+            pat_ew = self.pat_scorer(h_pat, pat_ei)
+            feat_ew = self.feat_scorer(h_feat, feat_ei)
+
+            combined_h = torch.cat([h_pat, h_feat], dim=0)
+
+            fi_idx = cross_ei[0]   # feature endpoints
+            p_idx = cross_ei[1]    # patient endpoints
+
+            fp_ei_off = torch.stack([
+                fi_idx + n_pat,   # feature as source (offset into combined)
+                p_idx             # patient as target
+            ])
+            cross_ew_fp = self.cross_scorer(combined_h, fp_ei_off)
+            pf_ei_off = torch.stack([
+                p_idx,            # patient as source
+                fi_idx + n_pat    # feature as target (offset into combined)
+            ])
+            cross_ew_pf = self.cross_scorer_pf(combined_h, pf_ei_off)
+            h_pat_pp = self.pat_lstms[li](h_pat, pat_ei, pat_ew)
+            h_feat_ff = self.feat_lstms[li](h_feat, feat_ei, feat_ew)
+            fp_ei = torch.stack([fi_idx, p_idx])
+            h_cross_pat = self._cross_aggregate(
+                h_feat_ff,
+                fp_ei,
+                cross_ew_fp,
+                n_pat,
+                dev,
+                self.cross_lstms[li]
+            )
+            pf_ei = torch.stack([p_idx, fi_idx])
+            h_cross_feat = self._cross_aggregate(
+                h_pat_pp,
+                pf_ei,
+                cross_ew_pf,
+                n_feat,
+                dev,
+                self.cross_lstms_pf[li]
+            )
+            gates_p = self.gate(torch.cat([h_pat_pp, h_cross_pat], dim=-1))
+            h_pat_new = (
+                gates_p[:, 0:1] * h_pat_pp +
+                gates_p[:, 1:2] * h_cross_pat
+            
+            gates_f = self.gate_feat(
+                torch.cat([h_feat_ff, h_cross_feat], dim=-1)
+            )
+            h_feat_new = (
+                gates_f[:, 0:1] * h_feat_ff +
+                gates_f[:, 1:2] * h_cross_feat
+            )
+
+            h_pat = self.norm_pat(h_pat_new)
+            h_feat = self.norm_feat(h_feat_new)
+
+            if li < self.n_layers - 1:
+                h_pat = self.mid_drop(h_pat)
+                h_feat = self.mid_drop(h_feat)
+
+        return h_pat
+
+    def _cross_aggregate(self, h_src, edge_index, edge_weights,
+                         n_tgt, dev, lstm_layer):
+        D = h_src.size(1)
+
+        src = edge_index[0]
+        tgt = edge_index[1]
+
+        seqs = []
+        lengths = []
+
+        for tgt_i in range(n_tgt):
+            mask = (tgt == tgt_i)
+            nbr_idx = src[mask]
+            nbr_w = edge_weights[mask]
+
+            if nbr_idx.numel() == 0:
+                seqs.append(torch.zeros(1, D, device=dev))
+                lengths.append(1)
+                continue
+
+            order = nbr_w.argsort(descending=True)
+
+            nbr_idx = nbr_idx[order][:lstm_layer.max_nbr]
+            nbr_w = nbr_w[order][:lstm_layer.max_nbr]
+
+            nbr_feats = h_src[nbr_idx] * nbr_w.unsqueeze(-1)
+
+            seqs.append(nbr_feats)
+            lengths.append(nbr_feats.size(0))
+
+        max_len = max(lengths)
+
+        padded = torch.zeros(n_tgt, max_len, D, device=dev)
+
+        for i, seq in enumerate(seqs):
+            padded[i, :seq.size(0)] = seq
+
+        lengths_t = torch.tensor(lengths, dtype=torch.long, device='cpu')
+
+        packed = nn.utils.rnn.pack_padded_sequence(
+            padded,
+            lengths_t,
+            batch_first=True,
+            enforce_sorted=False
+        )
+
+        _, (h_n, _) = lstm_layer.lstm(packed)
+
+        h_agg = h_n.squeeze(0)
+
+        x_zeros = torch.zeros(n_tgt, D, device=dev)
+
+        combined = torch.cat([x_zeros, h_agg], dim=-1)
+
+        out = lstm_layer.W(combined)
+        out = lstm_layer.norm(out)
+        out = F.relu(out)
+
+        return F.normalize(out, p=2, dim=-1)
+
+class OmicsPredictor(nn.Module):
+    def __init__(self, n_features, embed_dim, n_layers,
+                 max_nbr, n_classes, dropout=0.3):
+        super().__init__()
+
+        self.encoder = HeteroInductiveEncoder(
+            n_features,
+            embed_dim,
+            n_layers,
+            max_nbr,
+            dropout
+        )
+
+        self.classifier = nn.Linear(embed_dim, n_classes)
+
+    def forward(self, X, graph):
+        emb = self.encoder(X, graph)
+        logits = self.classifier(emb)
+
+        return emb, logits
+
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, embed_dim, n_heads, n_classes, n_omics, dropout=0.3):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim,
+            n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.drop = nn.Dropout(dropout)
+
+        self.fc = nn.Sequential(
+            nn.Linear(embed_dim * n_omics, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, n_classes)
+        )
+
+    def forward(self, embeddings):
+        x = torch.stack(embeddings, dim=1)
+
+        att, _ = self.attn(x, x, x)
+
+        x = self.norm(x + att)
+
+        x = self.drop(x.reshape(x.size(0), -1))
+
+        return self.fc(x)
+class HeteroInductiveOmics(nn.Module):
+    def __init__(self, n_features, embed_dim, n_layers, max_nbr,
+                 n_classes, n_heads, n_omics=3, dropout=0.3):
+        super().__init__()
+
+        self.predictors = nn.ModuleList([
+            OmicsPredictor(
+                n_features,
+                embed_dim,
+                n_layers,
+                max_nbr,
+                n_classes,
+                dropout
+            )
+            for _ in range(n_omics)
+        ])
+
+        self.fusion = CrossAttentionFusion(
+            embed_dim,
+            n_heads,
+            n_classes,
+            n_omics,
+            dropout
+        )
+
+    def forward(self, omics_list, graphs):
+        all_logits, all_embs = [], []
+
+        for i, (X, g) in enumerate(zip(omics_list, graphs)):
+            emb, logits = self.predictors[i](X, g)
+
+            all_logits.append(logits)
+            all_embs.append(emb)
+
+        fused = self.fusion(all_embs)
+
+        return all_logits, fused
+
+def move_graph(g, device):
+    return {
+        k: (ei.to(device), ew.to(device))
+        for k, (ei, ew) in g.items()
+    }
+
+def to_tensor(arr, device):
+    return torch.tensor(arr, dtype=torch.float32).to(device)
+
+def make_tensors(omics_list, y, device):
+    return (
+        [to_tensor(X, device) for X in omics_list],
+        torch.tensor(y, dtype=torch.long).to(device)
+    )
+def train_single(seed, omics_tr, y_tr, omics_val, y_val,
+                 graphs_tr, graphs_val, verbose=True):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    gtr = [move_graph(g, DEVICE) for g in graphs_tr]
+    gval = [move_graph(g, DEVICE) for g in graphs_val]
+
+    X_tr, y_tr_t = make_tensors(omics_tr, y_tr, DEVICE)
+    X_val, _ = make_tensors(omics_val, y_val, DEVICE)
+
+    if USE_CLASS_WEIGHTS:
+        cw = compute_class_weight(
+            'balanced',
+            classes=np.unique(y_tr),
+            y=y_tr
+        )
+
+        alpha = torch.tensor(cw, dtype=torch.float32).to(DEVICE)
+    else:
+        alpha = None
+
+    crit = FocalLoss(gamma=FOCAL_GAMMA, alpha=alpha)
+
+    model = HeteroInductiveOmics(
+        n_features=N_FEATURES,
+        embed_dim=EMBED_DIM,
+        n_layers=N_LAYERS,
+        max_nbr=MAX_NBR,
+        n_classes=NUM_CLASSES,
+        n_heads=N_HEADS,
+        n_omics=3,
+        dropout=DROPOUT
+    ).to(DEVICE)
+
+    opt = Adam(
+        model.parameters(),
+        lr=LR,
+        weight_decay=1e-4
+    )
+
+    sched = CosineAnnealingLR(
+        opt,
+        T_max=max(1, EPOCHS - WARMUP_EPOCHS),
+        eta_min=1e-5
+    )
+
+    best_score = 0.0
+    best_state = None
+
+    best_wf1 = 0.0
+    best_mf1 = 0.0
+    best_acc = 0.0
+    best_ep = 0
+
+    for epoch in range(1, EPOCHS + 1):
+
+        if epoch <= WARMUP_EPOCHS:
+            for pg in opt.param_groups:
+                pg['lr'] = LR * epoch / WARMUP_EPOCHS
+
+        model.train()
+        opt.zero_grad()
+
+        logits_list, fused = model(X_tr, gtr)
+
+        loss = crit(fused, y_tr_t)
+
+        for lg in logits_list:
+            loss = loss + 0.3 * crit(lg, y_tr_t)
+
+        loss.backward()
+        opt.step()
+
+        if epoch > WARMUP_EPOCHS:
+            sched.step()
+        if epoch % EVAL_EVERY == 0 or epoch == 1:
+            model.eval()
+
+            with torch.no_grad():
+                _, fused_val = model(X_val, gval)
+
+                preds = fused_val.argmax(1).cpu().numpy()
+
+                acc = accuracy_score(y_val, preds)
+
+                mf1 = f1_score(
+                    y_val,
+                    preds,
+                    average='macro',
+                    zero_division=0
+                )
+
+                wf1 = f1_score(
+                    y_val,
+                    preds,
+                    average='weighted',
+                    zero_division=0
+                )
+
+            score = wf1 if SELECT_METRIC == 'weighted' else mf1
+
+            if score > best_score:
+                best_score = score
+                best_wf1 = wf1
+                best_mf1 = mf1
+                best_acc = acc
+                best_ep = epoch
+
+                best_state = {
+                    k: v.clone()
+                    for k, v in model.state_dict().items()
+                }
+
+            if verbose and (epoch % 10 == 0 or epoch == 1):
+                print(
+                    f"    ep {epoch:>4} | loss {loss.item():.4f} | "
+                    f"val-acc {acc:.4f} | "
+                    f"val-macro-F1 {mf1:.4f} | "
+                    f"val-weighted-F1 {wf1:.4f}"
+                )
+
+    model.load_state_dict(best_state)
+
+    return model, best_wf1, best_mf1
+
+n_params = sum(
+    p.numel()
+    for p in HeteroInductiveOmics(
+        N_FEATURES,
+        EMBED_DIM,
+        N_LAYERS,
+        MAX_NBR,
+        NUM_CLASSES,
+        N_HEADS
+    ).parameters()
+    if p.requires_grad
+)
+
+model, best_wf1, best_mf1 = train_single(
+    SEED,
+    omics_train,
+    y_train,
+    omics_val,
+    y_val,
+    graphs_train,
+    graphs_val,
+    verbose=True
+)
+gte = [move_graph(g, DEVICE) for g in graphs_test]
+X_te, _ = make_tensors(omics_test, y_test, DEVICE)
+model.eval()
+with torch.no_grad():
+    _, fused_te = model(X_te, gte)
+    probs = F.softmax(fused_te, dim=-1)
+    preds = probs.argmax(1).cpu().numpy()
+
+for i, row in enumerate(cm):
+    print(f"  True{i}   " + "     ".join(map(str, row)))
